@@ -1,13 +1,23 @@
 [package]
 name = "vectoron"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
+rust-version = "1.85"
 authors = ["Seto Elkahfi <seto@ondeinference.com>"]
 description = "A minimal, modular machine-learning framework for inference."
 license = "MIT OR Apache-2.0"
 readme = "README.md"
-keywords = ["machine-learning", "inference", "tensor"]
+keywords = ["machine-learning", "inference", "tensor", "gguf", "llm"]
 categories = ["science"]
 exclude = [".gitignore"]
 
 [dependencies]
+half = "2"
+thiserror = "2"
+
+[dev-dependencies]
+tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
