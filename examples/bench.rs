@@ -36,14 +36,14 @@ fn main() -> vectoron::Result<()> {
         let started = Instant::now();
         let mut logits = Vec::new();
         for chunk in prompt.chunks(64) {
-            logits = model.forward(chunk, model.cache_len())?;
+            model.forward_into(chunk, model.cache_len(), &mut logits)?;
         }
         let prefill = started.elapsed().as_secs_f64();
 
         let started = Instant::now();
         for _ in 0..new_tokens {
             let next = argmax(&logits);
-            logits = model.forward(&[next], model.cache_len())?;
+            model.forward_into(&[next], model.cache_len(), &mut logits)?;
         }
         let decode = started.elapsed().as_secs_f64();
         println!(

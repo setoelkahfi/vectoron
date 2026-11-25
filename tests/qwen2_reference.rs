@@ -113,6 +113,13 @@ fn rewinding_the_cache_repeats_the_logits() {
     let (head, tail) = prompt.split_at(prompt.len() - 3);
     model.forward(head, 0).unwrap();
     let stepped = model.forward(tail, head.len()).unwrap();
+    // A reused buffer holds exactly the new logits, whatever was in it.
+    model.clear_kv_cache();
+    let mut reused = vec![f32::NAN; 3];
+    model.forward_into(head, 0, &mut reused).unwrap();
+    model.forward_into(tail, head.len(), &mut reused).unwrap();
+    assert_eq!(reused, stepped);
+
     let diff = batched
         .iter()
         .zip(&stepped)

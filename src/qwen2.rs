@@ -98,6 +98,24 @@ struct Layer {
     v_cache: Vec<f32>,
 }
 
+/// The buffers a forward pass works in. The model keeps them between calls,
+/// so decoding a token allocates nothing once they have grown to size.
+#[derive(Default)]
+struct Scratch {
+    x: Vec<f32>,
+    h: Vec<f32>,
+    q: Vec<f32>,
+    k: Vec<f32>,
+    v: Vec<f32>,
+    attn: Vec<f32>,
+    proj: Vec<f32>,
+    gate: Vec<f32>,
+    up: Vec<f32>,
+    scores: Vec<f32>,
+    /// Quantized copies of whichever vectors the current matrices read.
+    inputs: InputCache,
+}
+
 /// A loaded Qwen2 model with its key/value cache.
 ///
 /// The model keeps the GGUF file in memory as it was read and computes
@@ -112,6 +130,7 @@ pub struct Qwen2Model {
     inv_freq: Vec<f32>,
     cache_len: usize,
     kernels: Kernels,
+    scratch: Scratch,
 }
 
 impl Qwen2Model {
@@ -216,6 +235,7 @@ impl Qwen2Model {
             inv_freq,
             cache_len: 0,
             kernels: Kernels::default(),
+            scratch: Scratch::default(),
         })
     }
 
@@ -256,6 +276,22 @@ impl Qwen2Model {
     /// `pos` may be at most the current cache length. A smaller `pos`
     /// drops the cached positions from `pos` on, so a caller can rewind.
     pub fn forward(&mut self, tokens: &[u32], pos: usize) -> Result<Vec<f32>> {
+        let mut logits = Vec::new();
+        self.forward_into(tokens, pos, &mut logits)?;
+        Ok(logits)
+    }
+
+    /// [`Qwen2Model::forward`], writing the logits into `logits` in place of
+    /// whatever it held. A decode loop that passes the same buffer every
+    /// time allocates nothing per token beyond the cache's growth.
+    ///
+    /// On an error, `logits` and the cache are left as they were.
+    pub fn forward_into(
+        &mut self,
+        tokens: &[u32],
+        pos: usize,
+        logits: &mut Vec<f32>,
+    ) -> Result<()> {
         let t = tokens.len();
         if t == 0 {
             return Err(Error::Model("no tokens to run".into()));
@@ -289,35 +325,53 @@ impl Qwen2Model {
         let group = cfg.n_heads / cfg.n_kv_heads;
         let scale = 1.0 / (hd as f32).sqrt();
 
-        let mut x = vec![0f32; t * hidden];
+        // Taken out of the model so the layers can be borrowed alongside it.
+        // Nothing below returns early, so it always goes back.
+        let mut scratch = std::mem::take(&mut self.scratch);
+        let Scratch {
+            x,
+            h,
+            q,
+            k,
+            v,
+            attn,
+            proj,
+            gate,
+            up,
+            scores,
+            inputs,
+        } = &mut scratch;
+        // Every buffer is overwritten before it is read, except `attn`,
+        // which each layer zeroes.
+        for (buffer, len) in [
+            (&mut *x, t * hidden),
+            (&mut *h, t * hidden),
+            (&mut *q, t * q_dim),
+            (&mut *k, t * kv_dim),
+            (&mut *v, t * kv_dim),
+            (&mut *attn, t * q_dim),
+            (&mut *proj, t * hidden),
+            (&mut *gate, t * cfg.ffn),
+            (&mut *up, t * cfg.ffn),
+        ] {
+            buffer.resize(len, 0.0);
+        }
         for (row, &id) in x.chunks_exact_mut(hidden).zip(tokens) {
             self.embed.dequantize_row(data, id as usize, row);
         }
-
-        let mut h = vec![0f32; t * hidden];
-        let mut q = vec![0f32; t * q_dim];
-        let mut k = vec![0f32; t * kv_dim];
-        let mut v = vec![0f32; t * kv_dim];
-        let mut attn = vec![0f32; t * q_dim];
-        let mut proj = vec![0f32; t * hidden];
-        let mut gate = vec![0f32; t * cfg.ffn];
-        let mut up = vec![0f32; t * cfg.ffn];
-        let mut scores = Vec::with_capacity(pos + t);
         let kernels = self.kernels;
-        // Quantized copies of whichever vectors the current matrices read.
-        let mut cache = InputCache::default();
 
         for layer in &mut self.layers {
-            h.copy_from_slice(&x);
-            rms_norm(&mut h, &layer.attn_norm, cfg.rms_eps);
+            h.copy_from_slice(x);
+            rms_norm(h, &layer.attn_norm, cfg.rms_eps);
 
-            let mut input = Input::new(&h, t, kernels, &mut cache);
-            layer.wq.matmul(data, &mut input, &mut q);
-            layer.wk.matmul(data, &mut input, &mut k);
-            layer.wv.matmul(data, &mut input, &mut v);
-            add_bias(&mut q, &layer.bq);
-            add_bias(&mut k, &layer.bk);
-            add_bias(&mut v, &layer.bv);
+            let mut input = Input::new(h, t, kernels, inputs);
+            layer.wq.matmul(data, &mut input, q);
+            layer.wk.matmul(data, &mut input, k);
+            layer.wv.matmul(data, &mut input, v);
+            add_bias(q, &layer.bq);
+            add_bias(k, &layer.bk);
+            add_bias(v, &layer.bv);
 
             for ti in 0..t {
                 let p = pos + ti;
@@ -328,8 +382,8 @@ impl Qwen2Model {
                     rope(head, p, &self.inv_freq);
                 }
             }
-            layer.k_cache.extend_from_slice(&k);
-            layer.v_cache.extend_from_slice(&v);
+            layer.k_cache.extend_from_slice(k);
+            layer.v_cache.extend_from_slice(v);
 
             attn.fill(0.0);
             for ti in 0..t {
@@ -342,7 +396,7 @@ impl Qwen2Model {
                         let kh = &layer.k_cache[p * kv_dim + kv_off..][..hd];
                         scores.push(simd::dot(qh, kh) * scale);
                     }
-                    softmax(&mut scores);
+                    softmax(scores);
                     let out = &mut attn[ti * q_dim + head * hd..][..hd];
                     for (p, &w) in scores.iter().enumerate() {
                         let vh = &layer.v_cache[p * kv_dim + kv_off..][..hd];
@@ -351,33 +405,34 @@ impl Qwen2Model {
                 }
             }
 
-            let mut input = Input::new(&attn, t, kernels, &mut cache);
-            layer.wo.matmul(data, &mut input, &mut proj);
-            for (x, p) in x.iter_mut().zip(&proj) {
+            let mut input = Input::new(attn, t, kernels, inputs);
+            layer.wo.matmul(data, &mut input, proj);
+            for (x, p) in x.iter_mut().zip(proj.iter()) {
                 *x += p;
             }
 
-            h.copy_from_slice(&x);
-            rms_norm(&mut h, &layer.ffn_norm, cfg.rms_eps);
-            let mut input = Input::new(&h, t, kernels, &mut cache);
-            layer.gate.matmul(data, &mut input, &mut gate);
-            layer.up.matmul(data, &mut input, &mut up);
-            for (g, u) in gate.iter_mut().zip(&up) {
+            h.copy_from_slice(x);
+            rms_norm(h, &layer.ffn_norm, cfg.rms_eps);
+            let mut input = Input::new(h, t, kernels, inputs);
+            layer.gate.matmul(data, &mut input, gate);
+            layer.up.matmul(data, &mut input, up);
+            for (g, u) in gate.iter_mut().zip(up.iter()) {
                 *g = silu(*g) * u;
             }
-            let mut input = Input::new(&gate, t, kernels, &mut cache);
-            layer.down.matmul(data, &mut input, &mut proj);
-            for (x, p) in x.iter_mut().zip(&proj) {
+            let mut input = Input::new(gate, t, kernels, inputs);
+            layer.down.matmul(data, &mut input, proj);
+            for (x, p) in x.iter_mut().zip(proj.iter()) {
                 *x += p;
             }
         }
         self.cache_len = pos + t;
 
-        let mut last = x[(t - 1) * hidden..].to_vec();
-        rms_norm(&mut last, &self.output_norm, cfg.rms_eps);
-        let mut logits = vec![0f32; cfg.vocab];
-        let mut input = Input::new(&last, 1, kernels, &mut cache);
-        self.lm_head.matmul(data, &mut input, &mut logits);
-        Ok(logits)
+        let last = &mut x[(t - 1) * hidden..];
+        rms_norm(last, &self.output_norm, cfg.rms_eps);
+        logits.resize(cfg.vocab, 0.0);
+        let mut input = Input::new(last, 1, kernels, inputs);
+        self.lm_head.matmul(data, &mut input, logits);
+        self.scratch = scratch;
+        Ok(())
     }
 }
