@@ -1,4 +1,4 @@
-//! Chats with a Qwen2 GGUF model from the command line.
+//! Chats with a Qwen2 or Qwen3 GGUF model from the command line.
 //!
 //! ```sh
 //! cargo run --release --example generate -- model.gguf tokenizer.json "Why is the sky blue?"

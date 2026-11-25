@@ -1,4 +1,9 @@
-//! The Qwen2 decoder (also used by Qwen2.5), loaded from GGUF.
+//! The Qwen2 (also Qwen2.5) and Qwen3 decoders, loaded from GGUF.
+//!
+//! The two differ in attention: Qwen2 adds biases to the query, key and
+//! value projections. Qwen3 has none, normalizes each query and key head
+//! before the rotary embedding, and sets the head size independently of the
+//! model's width.
 
 use std::sync::Arc;
 
@@ -9,9 +14,29 @@ use crate::tensor::{
     Input, InputCache, Kernels, QMatrix, add_bias, load_vector, rms_norm, rope, silu, softmax,
 };
 
+/// Which decoder a GGUF file holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QwenArch {
+    /// `qwen2`: Qwen2 and Qwen2.5.
+    Qwen2,
+    /// `qwen3`. The mixture-of-experts `qwen3moe` is not supported.
+    Qwen3,
+}
+
+impl QwenArch {
+    /// The architecture's name in GGUF, which prefixes its metadata keys.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Qwen2 => "qwen2",
+            Self::Qwen3 => "qwen3",
+        }
+    }
+}
+
 /// Hyperparameters, read from the GGUF metadata.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Qwen2Config {
+pub struct QwenConfig {
+    pub arch: QwenArch,
     pub n_layers: usize,
     pub n_heads: usize,
     pub n_kv_heads: usize,
@@ -24,55 +49,79 @@ pub struct Qwen2Config {
     pub rope_theta: f32,
 }
 
-impl Qwen2Config {
-    /// Reads the configuration of a `qwen2` GGUF file.
+impl QwenConfig {
+    /// Reads the configuration of a `qwen2` or `qwen3` GGUF file.
     pub fn from_gguf(gguf: &Gguf) -> Result<Self> {
-        let arch = gguf
+        let arch = match gguf
             .get("general.architecture")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| Error::Metadata("general.architecture".into()))?;
-        if arch != "qwen2" {
-            return Err(Error::Model(format!(
-                "expected a qwen2 model, found `{arch}`"
-            )));
-        }
-        let int = |key: &str| -> Result<usize> {
-            gguf.get(key)
+            .ok_or_else(|| Error::Metadata("general.architecture".into()))?
+        {
+            "qwen2" => QwenArch::Qwen2,
+            "qwen3" => QwenArch::Qwen3,
+            other => {
+                return Err(Error::Model(format!(
+                    "unsupported architecture `{other}`: vectoron runs qwen2 and qwen3"
+                )));
+            }
+        };
+        let key = |name: &str| format!("{}.{name}", arch.name());
+        let optional = |name: &str| -> Option<usize> {
+            gguf.get(&key(name))
                 .and_then(|v| v.as_u64())
                 .and_then(|v| usize::try_from(v).ok())
-                .ok_or_else(|| Error::Metadata(key.into()))
         };
-        let float = |key: &str| -> Result<f32> {
-            gguf.get(key)
+        let int = |name: &str| -> Result<usize> {
+            optional(name).ok_or_else(|| Error::Metadata(key(name)))
+        };
+        let float = |name: &str| -> Result<f32> {
+            gguf.get(&key(name))
                 .and_then(|v| v.as_f32())
-                .ok_or_else(|| Error::Metadata(key.into()))
+                .ok_or_else(|| Error::Metadata(key(name)))
         };
 
-        let n_heads = int("qwen2.attention.head_count")?;
-        let n_kv_heads = int("qwen2.attention.head_count_kv")?;
-        let hidden = int("qwen2.embedding_length")?;
-        if n_heads == 0 || n_kv_heads == 0 || hidden % n_heads != 0 || n_heads % n_kv_heads != 0 {
+        let n_heads = int("attention.head_count")?;
+        let n_kv_heads = int("attention.head_count_kv")?;
+        let hidden = int("embedding_length")?;
+        if n_heads == 0 || n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
             return Err(Error::Model(format!(
-                "inconsistent head counts: {n_heads} heads, {n_kv_heads} key/value heads, width {hidden}"
+                "inconsistent head counts: {n_heads} heads, {n_kv_heads} key/value heads"
             )));
         }
-        let head_dim = hidden / n_heads;
-        if head_dim % 2 != 0 {
-            return Err(Error::Model(format!("head size {head_dim} is odd")));
+        let head_dim = match optional("attention.key_length") {
+            Some(size) => size,
+            None if hidden % n_heads == 0 => hidden / n_heads,
+            None => {
+                return Err(Error::Model(format!(
+                    "width {hidden} does not split into {n_heads} heads"
+                )));
+            }
+        };
+        if head_dim == 0 || head_dim % 2 != 0 {
+            return Err(Error::Model(format!(
+                "head size {head_dim} is not a positive even number"
+            )));
+        }
+        let value_dim = optional("attention.value_length").unwrap_or(head_dim);
+        if value_dim != head_dim {
+            return Err(Error::Model(format!(
+                "value heads of size {value_dim} differ from key heads of size {head_dim}"
+            )));
         }
         let embed = QMatrix::from_gguf(gguf, "token_embd.weight")?;
 
         Ok(Self {
-            n_layers: int("qwen2.block_count")?,
+            arch,
+            n_layers: int("block_count")?,
             n_heads,
             n_kv_heads,
             head_dim,
             hidden,
-            ffn: int("qwen2.feed_forward_length")?,
+            ffn: int("feed_forward_length")?,
             vocab: embed.rows,
-            context_length: int("qwen2.context_length")?,
-            rms_eps: float("qwen2.attention.layer_norm_rms_epsilon")?,
-            rope_theta: float("qwen2.rope.freq_base").unwrap_or(10_000.0),
+            context_length: int("context_length")?,
+            rms_eps: float("attention.layer_norm_rms_epsilon")?,
+            rope_theta: float("rope.freq_base").unwrap_or(10_000.0),
         })
     }
 
@@ -86,9 +135,10 @@ struct Layer {
     wq: QMatrix,
     wk: QMatrix,
     wv: QMatrix,
-    bq: Vec<f32>,
-    bk: Vec<f32>,
-    bv: Vec<f32>,
+    /// Qwen2's query, key and value biases.
+    biases: Option<[Vec<f32>; 3]>,
+    /// Qwen3's per-head norm weights for queries and keys.
+    head_norms: Option<[Vec<f32>; 2]>,
     wo: QMatrix,
     ffn_norm: Vec<f32>,
     gate: QMatrix,
@@ -116,12 +166,12 @@ struct Scratch {
     inputs: InputCache,
 }
 
-/// A loaded Qwen2 model with its key/value cache.
+/// A loaded Qwen2 or Qwen3 model with its key/value cache.
 ///
 /// The model keeps the GGUF file in memory as it was read and computes
 /// with the quantized weights in place.
-pub struct Qwen2Model {
-    config: Qwen2Config,
+pub struct QwenModel {
+    config: QwenConfig,
     data: Arc<Vec<u8>>,
     embed: QMatrix,
     layers: Vec<Layer>,
@@ -133,7 +183,7 @@ pub struct Qwen2Model {
     scratch: Scratch,
 }
 
-impl Qwen2Model {
+impl QwenModel {
     /// Parses a GGUF file and loads the model from it.
     pub fn load(bytes: Vec<u8>) -> Result<Self> {
         Self::from_gguf(&Gguf::parse(bytes)?)
@@ -142,7 +192,7 @@ impl Qwen2Model {
     /// Loads the model from a parsed GGUF file. The file's buffer is
     /// shared, not copied.
     pub fn from_gguf(gguf: &Gguf) -> Result<Self> {
-        let config = Qwen2Config::from_gguf(gguf)?;
+        let config = QwenConfig::from_gguf(gguf)?;
         let embed = QMatrix::from_gguf(gguf, "token_embd.weight")?;
         // Models with tied embeddings have no separate output matrix.
         let lm_head = match gguf.tensor("output.weight") {
@@ -175,9 +225,20 @@ impl Qwen2Model {
                 wq: mat("attn_q.weight")?,
                 wk: mat("attn_k.weight")?,
                 wv: mat("attn_v.weight")?,
-                bq: vec("attn_q.bias")?,
-                bk: vec("attn_k.bias")?,
-                bv: vec("attn_v.bias")?,
+                biases: match config.arch {
+                    QwenArch::Qwen2 => Some([
+                        vec("attn_q.bias")?,
+                        vec("attn_k.bias")?,
+                        vec("attn_v.bias")?,
+                    ]),
+                    QwenArch::Qwen3 => None,
+                },
+                head_norms: match config.arch {
+                    QwenArch::Qwen2 => None,
+                    QwenArch::Qwen3 => {
+                        Some([vec("attn_q_norm.weight")?, vec("attn_k_norm.weight")?])
+                    }
+                },
                 wo: mat("attn_output.weight")?,
                 ffn_norm: vec("ffn_norm.weight")?,
                 gate: mat("ffn_gate.weight")?,
@@ -203,11 +264,18 @@ impl Qwen2Model {
                 config.hidden,
                 config.ffn,
             )?;
+            let biases_fit = layer
+                .biases
+                .as_ref()
+                .is_none_or(|[q, k, v]| q.len() == q_dim && k.len() == kv_dim && v.len() == kv_dim);
+            let head_norms_fit = layer
+                .head_norms
+                .as_ref()
+                .is_none_or(|norms| norms.iter().all(|n| n.len() == config.head_dim));
             if layer.attn_norm.len() != config.hidden
                 || layer.ffn_norm.len() != config.hidden
-                || layer.bq.len() != q_dim
-                || layer.bk.len() != kv_dim
-                || layer.bv.len() != kv_dim
+                || !biases_fit
+                || !head_norms_fit
             {
                 return Err(Error::Model(format!(
                     "layer {i} has mis-sized norms or biases"
@@ -247,7 +315,7 @@ impl Qwen2Model {
     }
 
     /// The model's hyperparameters.
-    pub fn config(&self) -> &Qwen2Config {
+    pub fn config(&self) -> &QwenConfig {
         &self.config
     }
 
@@ -281,7 +349,7 @@ impl Qwen2Model {
         Ok(logits)
     }
 
-    /// [`Qwen2Model::forward`], writing the logits into `logits` in place of
+    /// [`QwenModel::forward`], writing the logits into `logits` in place of
     /// whatever it held. A decode loop that passes the same buffer every
     /// time allocates nothing per token beyond the cache's growth.
     ///
@@ -369,9 +437,19 @@ impl Qwen2Model {
             layer.wq.matmul(data, &mut input, q);
             layer.wk.matmul(data, &mut input, k);
             layer.wv.matmul(data, &mut input, v);
-            add_bias(q, &layer.bq);
-            add_bias(k, &layer.bk);
-            add_bias(v, &layer.bv);
+            if let Some([bq, bk, bv]) = &layer.biases {
+                add_bias(q, bq);
+                add_bias(k, bk);
+                add_bias(v, bv);
+            }
+            if let Some([q_norm, k_norm]) = &layer.head_norms {
+                for head in q.chunks_exact_mut(hd) {
+                    rms_norm(head, q_norm, cfg.rms_eps);
+                }
+                for head in k.chunks_exact_mut(hd) {
+                    rms_norm(head, k_norm, cfg.rms_eps);
+                }
+            }
 
             for ti in 0..t {
                 let p = pos + ti;
