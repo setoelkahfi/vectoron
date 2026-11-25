@@ -5,7 +5,9 @@ use std::sync::Arc;
 use crate::error::{Error, Result};
 use crate::gguf::Gguf;
 use crate::simd;
-use crate::tensor::{QMatrix, add_bias, load_vector, rms_norm, rope, silu, softmax};
+use crate::tensor::{
+    Input, InputCache, Kernels, QMatrix, add_bias, load_vector, rms_norm, rope, silu, softmax,
+};
 
 /// Hyperparameters, read from the GGUF metadata.
 #[derive(Debug, Clone, PartialEq)]
@@ -109,6 +111,7 @@ pub struct Qwen2Model {
     lm_head: QMatrix,
     inv_freq: Vec<f32>,
     cache_len: usize,
+    kernels: Kernels,
 }
 
 impl Qwen2Model {
@@ -212,7 +215,15 @@ impl Qwen2Model {
             lm_head,
             inv_freq,
             cache_len: 0,
+            kernels: Kernels::default(),
         })
+    }
+
+    /// Chooses the arithmetic of the matrix products. [`Kernels::Integer`]
+    /// is the default; [`Kernels::F32`] is the slower reference. The cached
+    /// keys and values stay valid, but replies may differ between the two.
+    pub fn set_kernels(&mut self, kernels: Kernels) {
+        self.kernels = kernels;
     }
 
     /// The model's hyperparameters.
@@ -292,14 +303,18 @@ impl Qwen2Model {
         let mut gate = vec![0f32; t * cfg.ffn];
         let mut up = vec![0f32; t * cfg.ffn];
         let mut scores = Vec::with_capacity(pos + t);
+        let kernels = self.kernels;
+        // Quantized copies of whichever vectors the current matrices read.
+        let mut cache = InputCache::default();
 
         for layer in &mut self.layers {
             h.copy_from_slice(&x);
             rms_norm(&mut h, &layer.attn_norm, cfg.rms_eps);
 
-            layer.wq.matmul(data, &h, t, &mut q);
-            layer.wk.matmul(data, &h, t, &mut k);
-            layer.wv.matmul(data, &h, t, &mut v);
+            let mut input = Input::new(&h, t, kernels, &mut cache);
+            layer.wq.matmul(data, &mut input, &mut q);
+            layer.wk.matmul(data, &mut input, &mut k);
+            layer.wv.matmul(data, &mut input, &mut v);
             add_bias(&mut q, &layer.bq);
             add_bias(&mut k, &layer.bk);
             add_bias(&mut v, &layer.bv);
@@ -336,19 +351,22 @@ impl Qwen2Model {
                 }
             }
 
-            layer.wo.matmul(data, &attn, t, &mut proj);
+            let mut input = Input::new(&attn, t, kernels, &mut cache);
+            layer.wo.matmul(data, &mut input, &mut proj);
             for (x, p) in x.iter_mut().zip(&proj) {
                 *x += p;
             }
 
             h.copy_from_slice(&x);
             rms_norm(&mut h, &layer.ffn_norm, cfg.rms_eps);
-            layer.gate.matmul(data, &h, t, &mut gate);
-            layer.up.matmul(data, &h, t, &mut up);
+            let mut input = Input::new(&h, t, kernels, &mut cache);
+            layer.gate.matmul(data, &mut input, &mut gate);
+            layer.up.matmul(data, &mut input, &mut up);
             for (g, u) in gate.iter_mut().zip(&up) {
                 *g = silu(*g) * u;
             }
-            layer.down.matmul(data, &gate, t, &mut proj);
+            let mut input = Input::new(&gate, t, kernels, &mut cache);
+            layer.down.matmul(data, &mut input, &mut proj);
             for (x, p) in x.iter_mut().zip(&proj) {
                 *x += p;
             }
@@ -358,7 +376,8 @@ impl Qwen2Model {
         let mut last = x[(t - 1) * hidden..].to_vec();
         rms_norm(&mut last, &self.output_norm, cfg.rms_eps);
         let mut logits = vec![0f32; cfg.vocab];
-        self.lm_head.matmul(data, &last, 1, &mut logits);
+        let mut input = Input::new(&last, 1, kernels, &mut cache);
+        self.lm_head.matmul(data, &mut input, &mut logits);
         Ok(logits)
     }
 }

@@ -38,6 +38,7 @@
 
 pub mod error;
 pub mod gguf;
+pub mod kernels;
 pub mod quant;
 pub mod qwen2;
 pub mod sample;
@@ -48,3 +49,4 @@ pub use error::{Error, Result};
 pub use gguf::Gguf;
 pub use qwen2::{Qwen2Config, Qwen2Model};
 pub use sample::{Sampler, SamplerConfig};
+pub use tensor::Kernels;

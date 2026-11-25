@@ -8,9 +8,12 @@
 //! ```
 //!
 //! The fixture holds the prompt's token ids on its first line and the 32
-//! expected greedy tokens on its second.
+//! expected greedy tokens on its second. The stored tokens come from the
+//! `f32` kernels; the integer kernels are checked against those, position by
+//! position.
 
-use vectoron::{Qwen2Model, Sampler};
+use vectoron::sample::argmax;
+use vectoron::{Kernels, Qwen2Model, Sampler};
 
 fn ids(line: &str) -> Vec<u32> {
     line.split_whitespace()
@@ -28,6 +31,7 @@ fn greedy_tokens_match_the_reference() {
     let expected = ids(lines.next().unwrap());
 
     let mut model = Qwen2Model::load(std::fs::read(path).unwrap()).unwrap();
+    model.set_kernels(Kernels::F32);
     let mut sampler = Sampler::greedy();
     let mut logits = model.forward(&prompt, 0).unwrap();
     let mut got = Vec::new();
@@ -37,6 +41,61 @@ fn greedy_tokens_match_the_reference() {
         logits = model.forward(&[next], model.cache_len()).unwrap();
     }
     assert_eq!(got, expected);
+}
+
+/// Both kernels read the same token sequence (teacher forcing), so one early
+/// difference cannot cascade. They must pick the same next token almost
+/// everywhere, and the logits near the top must stay close.
+///
+/// Rounding the activations to `i8` moves a logit by about 0.1 on average
+/// (measured: native 0.105, wasm simd128 0.098) with a worst case of 0.6 to
+/// 1.0 over these 32 positions. The bounds leave room for that tail. A broken
+/// kernel is off by whole units and flips the top token.
+#[test]
+#[ignore = "needs VECTORON_TEST_GGUF"]
+fn integer_kernels_agree_with_f32() {
+    let path = std::env::var("VECTORON_TEST_GGUF").expect("set VECTORON_TEST_GGUF");
+    let fixture = include_str!("fixtures/qwen2_0_5b_greedy.txt");
+    let mut lines = fixture.lines();
+    let prompt = ids(lines.next().unwrap());
+    let expected = ids(lines.next().unwrap());
+
+    let bytes = std::fs::read(path).unwrap();
+    let mut reference = Qwen2Model::load(bytes.clone()).unwrap();
+    reference.set_kernels(Kernels::F32);
+    let mut integer = Qwen2Model::load(bytes).unwrap();
+
+    let mut input = prompt;
+    let mut agreed = 0;
+    let mut worst = 0f32;
+    let (mut total, mut count) = (0f64, 0usize);
+    for &next in &expected {
+        let a = reference.forward(&input, reference.cache_len()).unwrap();
+        let b = integer.forward(&input, integer.cache_len()).unwrap();
+        agreed += usize::from(argmax(&a) == argmax(&b));
+        // Compare the logits that can matter: those within reach of the top.
+        let top = a.iter().copied().fold(f32::MIN, f32::max);
+        for (x, y) in a.iter().zip(&b) {
+            if *x > top - 5.0 {
+                worst = worst.max((x - y).abs());
+                total += f64::from((x - y).abs());
+                count += 1;
+            }
+        }
+        input = vec![next];
+    }
+    let mean = total / count as f64;
+    println!(
+        "top-1 agreement {agreed}/{}, mean difference {mean:.3}, worst {worst:.3}",
+        expected.len()
+    );
+    assert!(
+        agreed * 20 >= expected.len() * 19,
+        "{agreed} of {}",
+        expected.len()
+    );
+    assert!(mean < 0.25, "mean logit difference {mean}");
+    assert!(worst < 2.0, "worst logit difference {worst}");
 }
 
 #[test]
