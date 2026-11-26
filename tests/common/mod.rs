@@ -62,7 +62,7 @@ pub fn compare(bytes: Vec<u8>, prompt: &[u32], expected: &[u32]) -> Comparison {
         f32_matches,
         integer_matches,
         agreed,
-        mean: total / count as f64,
+        mean: if count > 0 { total / count as f64 } else { 0.0 },
         worst,
     };
     println!(
