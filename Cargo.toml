@@ -1,11 +1,12 @@
 [package]
 name = "vectoron"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.85"
 authors = ["Seto Elkahfi <seto@ondeinference.com>"]
 description = "A minimal, modular machine-learning framework for inference."
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/setoelkahfi/vectoron"
 readme = "README.md"
 keywords = ["machine-learning", "inference", "tensor", "gguf", "llm"]
 categories = ["science"]
