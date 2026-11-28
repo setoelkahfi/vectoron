@@ -2,6 +2,7 @@
 
 use crate::error::{Error, Result};
 use crate::gguf::{Gguf, TensorInfo};
+use crate::kernels::{self, Quantized};
 use crate::quant::{GgmlType, QK_K, dequantize};
 use crate::simd;
 
@@ -54,12 +55,31 @@ impl QMatrix {
         dequantize(self.ty, self.row(data, r), &mut out[..self.cols]);
     }
 
+    /// Like [`QMatrix::matmul_f32`], but through the integer kernels in
+    /// [`crate::kernels`] when this matrix's type has one. `x` is quantized
+    /// on the way in, once per block size, and `input` keeps the result for
+    /// the next matrix that reads the same vectors.
+    pub fn matmul(&self, data: &[u8], input: &mut Input<'_>, out: &mut [f32]) {
+        let t = input.t;
+        let quantized =
+            kernels::activation_block(self.ty).filter(|_| input.kernels == Kernels::Integer);
+        let Some(block) = quantized else {
+            return self.matmul_f32(data, input.x, t, out);
+        };
+        debug_assert_eq!(input.x.len(), t * self.cols);
+        debug_assert_eq!(out.len(), t * self.rows);
+        let x = input.quantized(self.cols, block);
+        for o in 0..self.rows {
+            kernels::dot_row(self.ty, self.row(data, o), x, &mut out[o..], self.rows);
+        }
+    }
+
     /// `out[t][o] = row(o) · x[t]` for `t` input vectors of length `cols`
     /// stored back to back in `x`. `out` holds `t` vectors of length `rows`.
     ///
-    /// Each block of a row is dequantized once and then applied to all `t`
-    /// inputs, so a batch costs one pass over the weights.
-    pub fn matmul(&self, data: &[u8], x: &[f32], t: usize, out: &mut [f32]) {
+    /// Each block of a row is dequantized to `f32` once and then applied to
+    /// all `t` inputs, so a batch costs one pass over the weights.
+    pub fn matmul_f32(&self, data: &[u8], x: &[f32], t: usize, out: &mut [f32]) {
         debug_assert_eq!(x.len(), t * self.cols);
         debug_assert_eq!(out.len(), t * self.rows);
         out.fill(0.0);
@@ -81,6 +101,63 @@ impl QMatrix {
                 byte += nb;
             }
         }
+    }
+}
+
+/// Which arithmetic [`QMatrix::matmul`] uses.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Kernels {
+    /// Quantize the activations and multiply in integers where the weight
+    /// type has a kernel. Much faster, and slightly less precise.
+    #[default]
+    Integer,
+    /// Dequantize the weights and multiply in `f32`. The reference.
+    F32,
+}
+
+/// `t` input vectors for one or more [`QMatrix::matmul`] calls.
+#[derive(Debug)]
+pub struct Input<'a> {
+    x: &'a [f32],
+    t: usize,
+    kernels: Kernels,
+    /// The quantized copies, by block size.
+    cache: &'a mut InputCache,
+}
+
+/// Buffers for the quantized copies an [`Input`] makes, reused across calls.
+#[derive(Debug, Default)]
+pub struct InputCache {
+    entries: [(usize, Quantized); 2],
+}
+
+impl<'a> Input<'a> {
+    /// Wraps `x`, `t` vectors back to back. `cache` holds the quantized
+    /// copies; anything it held before is discarded.
+    pub fn new(x: &'a [f32], t: usize, kernels: Kernels, cache: &'a mut InputCache) -> Self {
+        for entry in &mut cache.entries {
+            entry.0 = 0;
+        }
+        Self {
+            x,
+            t,
+            kernels,
+            cache,
+        }
+    }
+
+    fn quantized(&mut self, cols: usize, block: usize) -> &Quantized {
+        let entries = &mut self.cache.entries;
+        let slot = match entries.iter().position(|e| e.0 == block) {
+            Some(i) => i,
+            None => {
+                let i = entries.iter().position(|e| e.0 == 0).unwrap_or(0);
+                entries[i].1.quantize(self.x, cols, block);
+                entries[i].0 = block;
+                i
+            }
+        };
+        &entries[slot].1
     }
 }
 

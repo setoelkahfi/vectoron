@@ -79,7 +79,7 @@ impl GgmlType {
 }
 
 #[inline]
-fn f16_at(b: &[u8], i: usize) -> f32 {
+pub(crate) fn f16_at(b: &[u8], i: usize) -> f32 {
     f16::from_le_bytes([b[i], b[i + 1]]).to_f32()
 }
 
@@ -182,7 +182,7 @@ fn q8_0(b: &[u8], y: &mut [f32]) {
 
 /// The 6-bit scale and min of sub-block `j` (0..8) of a Q4_K or Q5_K block.
 #[inline]
-fn scale_min_k4(j: usize, s: &[u8]) -> (u8, u8) {
+pub(crate) fn scale_min_k4(j: usize, s: &[u8]) -> (u8, u8) {
     if j < 4 {
         (s[j] & 63, s[j + 4] & 63)
     } else {

@@ -1,4 +1,4 @@
-//! Chats with a Qwen2 GGUF model from the command line.
+//! Chats with a Qwen2 or Qwen3 GGUF model from the command line.
 //!
 //! ```sh
 //! cargo run --release --example generate -- model.gguf tokenizer.json "Why is the sky blue?"
@@ -77,7 +77,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             std::io::stdout().flush()?;
             printed = text.len();
         }
-        logits = model.forward(&[next], model.cache_len())?;
+        model.forward_into(&[next], model.cache_len(), &mut logits)?;
     }
     let secs = started.elapsed().as_secs_f32();
     println!();
